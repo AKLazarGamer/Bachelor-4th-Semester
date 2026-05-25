@@ -1,0 +1,229 @@
+%% QUBE-SERVO 3 - Linearization for LQR
+% Computes A and B matrices around upright equilibrium.
+% State order:
+% x = [theta; theta_dot; alpha; alpha_dot]
+%
+% Convention:
+% alpha = 0    -> pendulum hanging downward
+% alpha = pi   -> pendulum upright
+
+clear; clc; close all;
+
+%% ============================================================
+% 1) KNOWN PHYSICAL PARAMETERS
+% ============================================================
+p.g  = 9.81;
+
+% Motor
+p.Rm = 7.5;
+p.kt = 0.0422;
+p.km = 0.0422;
+p.Jm = 1.4e-6;
+
+% Hub
+p.Jh = 0.6e-6;
+
+% Disc
+p.md = 0.053;
+p.rd = 0.0248;
+
+% Rotary arm + pendulum
+p.mr = 0.095;
+p.Lr = 0.085;
+p.mp = 0.024;
+p.Lp = 0.129;
+
+%% ============================================================
+% 2) DERIVED INERTIAS
+% ============================================================
+p.Jd      = 0.5 * p.md * p.rd^2;
+p.Jr_arm  = (1/3) * p.mr * p.Lr^2;
+p.Jr_base = p.Jm + p.Jh + p.Jd + p.Jr_arm;
+p.Jp_base = (1/12) * p.mp * p.Lp^2;
+
+%% ============================================================
+% 3) IDENTIFIED EFFECTIVE PARAMETERS
+% ============================================================
+% These are the improved fitted parameters from the nonlinear model.
+
+p.Jr_extra = 0;
+p.Jp_scale = 0.134708;
+
+p.Br    = 1.355404e-04;
+p.Bp    = 6.699745e-05;
+p.Kg    = 2.197888;
+p.eta_g = 0.999915;
+p.Kc    = 2.791073e-03;
+
+p.eta_m = 1.0;
+p.Fc_r  = 0;
+p.Fc_p  = 0;
+
+% Deadzone was used in nonlinear simulation/identification,
+% but is NOT used in local LQR linearization.
+p.deadzone = 0.25;
+
+%% ============================================================
+% 4) FINAL INERTIAS
+% ============================================================
+p.Jr = p.Jr_base + p.Jr_extra;
+p.Jp = p.Jp_scale * p.Jp_base;
+
+fprintf('\n================ PARAMETERS USED FOR LINEARIZATION ================\n');
+fprintf('Jp_scale = %.6f\n', p.Jp_scale);
+fprintf('Br       = %.6e N*m*s/rad\n', p.Br);
+fprintf('Bp       = %.6e N*m*s/rad\n', p.Bp);
+fprintf('Kg       = %.6f\n', p.Kg);
+fprintf('eta_g    = %.6f\n', p.eta_g);
+fprintf('eta_m    = %.6f\n', p.eta_m);
+fprintf('Kc       = %.6e N*m/rad\n', p.Kc);
+fprintf('deadzone = %.6f V  (not used in linearization)\n', p.deadzone);
+
+%% ============================================================
+% 5) EQUILIBRIUM FOR LQR
+% ============================================================
+x_eq = [0; 0; 0; 0];   % upright equilibrium
+u_eq = 0;               % nominal input voltage
+
+%% ============================================================
+% 6) NUMERICAL LINEARIZATION
+% ============================================================
+n = 4;
+A = zeros(n,n);
+B = zeros(n,1);
+
+eps_x = 1e-6;
+eps_u = 1e-6;
+
+% A matrix: df/dx
+for i = 1:n
+    dx = zeros(n,1);
+    dx(i) = eps_x;
+
+    f_plus  = qube_model_input_form(x_eq + dx, u_eq, p, false);
+    f_minus = qube_model_input_form(x_eq - dx, u_eq, p, false);
+
+    A(:,i) = (f_plus - f_minus) / (2 * eps_x);
+end
+
+% B matrix: df/du
+f_plus  = qube_model_input_form(x_eq, u_eq + eps_u, p, false);
+f_minus = qube_model_input_form(x_eq, u_eq - eps_u, p, false);
+
+B(:,1) = (f_plus - f_minus) / (2 * eps_u);
+
+%% ============================================================
+% 7) DISPLAY A AND B
+% ============================================================
+fprintf('\n================ LINEARIZED A MATRIX ================\n');
+disp(A)
+
+fprintf('\n================ LINEARIZED B MATRIX ================\n');
+disp(B)
+
+%% ============================================================
+% 8) SANITY CHECKS
+% ============================================================
+fprintf('\n================ SANITY CHECKS ================\n');
+
+ctrb_rank = rank(ctrb(A,B));
+fprintf('Controllability rank = %d / 4\n', ctrb_rank);
+
+open_loop_eigs = eig(A);
+fprintf('\nOpen-loop eigenvalues of A:\n');
+disp(open_loop_eigs)
+
+if any(real(open_loop_eigs) > 0)
+    fprintf('Open-loop upright model is unstable, as expected.\n');
+else
+    fprintf('WARNING: Open-loop upright model does not show an unstable pole.\n');
+end
+
+if ctrb_rank == 4
+    fprintf('System is controllable.\n');
+else
+    fprintf('WARNING: System is not fully controllable.\n');
+end
+
+%% ============================================================
+% 9) OPTIONAL TEST LQR DESIGN
+% ============================================================
+Q = diag([12.0, 0.1, 400.0, 6.0]);
+R = 18.5;
+
+K = lqr(A, B, Q, R);
+
+fprintf('\n================ TEST LQR GAIN ================\n');
+disp(K)
+
+closed_loop_eigs = eig(A - B*K);
+
+fprintf('\nClosed-loop eigenvalues of A - B*K:\n');
+disp(closed_loop_eigs)
+
+if all(real(closed_loop_eigs) < 0)
+    fprintf('Closed-loop system is stable with test LQR gain.\n');
+else
+    fprintf('WARNING: Closed-loop system is not stable with test LQR gain.\n');
+end
+
+%% ============================================================
+% LOCAL FUNCTION: NONLINEAR MODEL IN INPUT FORM
+% ============================================================
+function dx = qube_model_input_form(x, Vm, p, use_deadzone)
+
+    theta     = x(1);
+    theta_dot = x(2);
+    alpha     = x(3);
+    alpha_dot = x(4);
+
+    if use_deadzone
+        Vm_eff = sign(Vm) * max(0, abs(Vm) - p.deadzone);
+    else
+        Vm_eff = Vm;
+    end
+
+    % Motor torque model
+    tau = (p.eta_g * p.Kg * p.eta_m * p.kt * ...
+          (Vm_eff - p.Kg * p.km * theta_dot)) / p.Rm;
+
+    % Effective cable/stiffness term
+    tau_cable = -p.Kc * theta;
+
+    % Viscous damping
+    tau_f_theta = p.Br * theta_dot;
+    tau_f_alpha = p.Bp * alpha_dot;
+
+    % Mass matrix
+    A11 = p.mp*p.Lr^2 ...
+        + 0.25*p.mp*p.Lp^2 ...
+        - 0.25*p.mp*p.Lp^2*cos(alpha)^2 ...
+        + p.Jr;
+
+    A12 = -0.5*p.mp*p.Lp*p.Lr*cos(alpha);
+    A22 = p.Jp + 0.25*p.mp*p.Lp^2;
+
+    M = [A11, A12;
+         A12, A22];
+
+    % Nonlinear terms
+    N1 = 0.5*p.mp*p.Lp^2*sin(alpha)*cos(alpha)*theta_dot*alpha_dot ...
+       + 0.5*p.mp*p.Lp*p.Lr*sin(alpha)*alpha_dot^2;
+
+    N2 = 0.25*p.mp*p.Lp^2*cos(alpha)*sin(alpha)*theta_dot^2 ...
+       + 0.5*p.mp*p.Lp*p.g*sin(alpha);
+
+    rhs = [
+        tau + tau_cable - tau_f_theta - N1;
+        -tau_f_alpha + N2
+    ];
+
+    qdd = M \ rhs;
+
+    dx = [
+        theta_dot;
+        qdd(1);
+        alpha_dot;
+        qdd(2)
+    ];
+end
